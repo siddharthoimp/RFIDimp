@@ -4,47 +4,64 @@
 // Pin 5: SCLK
 // Pin 7: MOSI
 // Pin 8: CS_L
-// Pin 9: unused
+// Pin 9: LED_Red
+// Pin 6: GPIO_TX
+// Pin A: Button 1
+// Pin B: Button 2
+// Pin C: LED_Green
+// Pin D: GPIO
+// Pin E: GPIO_RX
 server.log("");
 server.log("AS3911 Eval Board Started");
 
 // Constants
 // SPI Clock Frequency in kHz
-// (over 2MHz may be unstable due to bug in AS3911, check errata document)
-const FREQ = 1000;
+// (2MHz may be unstable due to bug in AS3911, check errata document)
+const FREQ = 6000;
 // Receive types
-const RECEIVE_TYPE_UNKNOWN = 0;
-const RECEIVE_TYPE_ATQA = 1;
-const RECEIVE_TYPE_ANTICOLLISION = 2;
-const RECEIVE_TYPE_SAK = 3;
-
-//Number of seconds to wait before we go to sleep
-const SLEEP_TIME = 4;
+enum RECEIVE_TYPE {
+    UNKNOWN = 0
+    ATQA = 1
+    ANTICOLLISION = 2
+    SAK = 3
+    ATS = 4
+    PPSR = 5
+}
+const SLEEP_TIME = 10; // Number of seconds to wait before we go to sleep
+const CARD_RESET_TIME = 1; // Number of seconds after inactivity before we assume no card is present and we are ready to detect again
 
 class AS3911
 {
-  receiveType = null;      // Type of Received data
-	atqa = null;			// Answer to REQA
-	collision = null;		// Collision interrupt flag
-	cardPresent = null;	    // Flag for detecting physical presence of tag (through cap sensor, amplitude measurement, etc.)
-	UID = null;			    // Unique ID for RFID card
+    receiveType = null;  // Type of Recieved data
+    atqa = null;        	// Answer to REQA
+	cardPresent = null;	// Flag for detectomg physical presence of tag through cap sensor, etc.
+	UID = null;			// Unique ID for RFID card
+    CID = null;        // Card ID chosen by the reader for the card we are Working with (our AS3911)
 	cascadeLevel = null;	// Cascade level during select / anticollision process
-	sleepTime = null; // Time counter before we sleep
-  
+    UIDsize = null;     // size of UID; should be 1, 2, 3 for single, double, triple respectively. Single = 4 bytes, double = 7 bytes, triple = 10 bytes
+    resetTime = null; // Time counter before we sleep
+    interfaceBytes = null; // Interface Bytes for ISO 14443 A card
+    historicalBytes = null; // Historical Bytes for ISO 14443 A card
+    stopCapInterrupt = null; // Flag used to prevent Capacitance measurements from interrupting protocol flow
+	
 	// Alias objects
-	irq = null;	    // interrupt pin
-	spi = null;	    // serial port
+	irq = null;	// interrupt pin
+	spi = null;	// serial port
 	cs_l = null;	// chip select
 
 	constructor(interruptPin, serialPort, chipSelect){
 
 		receiveType = 0;
-		atqa = 0;
-		collision = 0;        
+		atqa = 0;      
 		cardPresent = 0;
 		UID = blob();
+        CID = 1; 
 		cascadeLevel = 1;
-    sleepTime = time() + SLEEP_TIME; 
+        UIDsize = 0;
+        resetTime = time() + CARD_RESET_TIME;
+        interfaceBytes = blob();
+        historicalBytes = blob();
+        stopCapInterrupt = false;
 
 		irq = interruptPin;
 		spi = serialPort;
@@ -105,10 +122,8 @@ class AS3911
 
 	// Read bytes from FIFO
 	function FIFORead() {
-		local bytesToRead = regRead(0x1A);  // Number of unread bytes in FIFO
-		local FIFOStatusReg = regRead(0x1B);// 
-//		server.log(format("FIFO REG1: 0x%02X", bytesToRead));
-//		server.log(format("FIFO REG2: 0x%02X", FIFOStatusReg));
+		local bytesToRead = regRead(0x1A);      // Number of unread bytes in FIFO
+		local FIFOStatusReg = regRead(0x1B);    // For debugging purposes
 		
 		cs_l.write(0);                      // Select AS3911
 		spi.write(format("%c", 0xBF));      // Write "FIFO Read" mode bits
@@ -140,7 +155,7 @@ class AS3911
 		if(isSelect) {
 			clearBit(0x09, 7);      // Make sure no_CRC_rx is cleared
 			clearBit(0x05, 0);      // Clear antcl
-			receiveType = RECEIVE_TYPE_SAK; // Expect to receive SAK
+			receiveType = RECEIVE_TYPE.SAK; // Expect to receive SAK
 			if (isFinal) {
 				FIFOBlob.writen(UID[3], 'b');
 				FIFOBlob.writen(UID[4], 'b');
@@ -162,7 +177,7 @@ class AS3911
 			directCommand(0xC4);    //Transmit contents of FIFO with CRC
 			server.log("Transmitting select packet:");
 		} else {
-			receiveType = RECEIVE_TYPE_ANTICOLLISION;   // Expect anticollision frame
+			receiveType = RECEIVE_TYPE.ANTICOLLISION;   // Expect anticollision frame
 			local length = (nvb >> 4) - FIFOBlob.len();
 			server.log(format("NVB: %i, Length: %i, FIFO length: %i", nvb >> 4, length, FIFOBlob.len()));
 			for (local i = 0; i < length && i < UID.len(); i++) {
@@ -177,41 +192,65 @@ class AS3911
 			directCommand(0xC5);    // Transmit contents of FIFO without CRC
 			server.log("Transmitting anticollision packet:");
 		}
-		
-		server.log("FIFO length: " + FIFOBlob.len());
-//		foreach (i, byte in FIFOBlob) {
-//			server.log(format("Byte %i: 0x%02X", i, byte));
-//		}
-		
 	}
 
+    // Send REQA
+    function sendREQA() {
+        server.log("Sending REQA");
+        stopCapInterrupt = true;
+    	receiveType = RECEIVE_TYPE.ATQA;    // Expect ATQA in response
+    	directCommand(0xC2);    // Clear (not necessary, but what the hell)
+    	directCommand(0xC6);    // Send REQA
+    }
+  
+    // Send RATS
+    function sendRATS() {
+    	server.log("Sending RATS");
+    	receiveType = RECEIVE_TYPE.ATS;    // Expect ATQA in response
+        local FIFOBlob = blob();
+        FIFOBlob.writen(0xE0, 'b'); // Start Byte
+        FIFOBlob.writen(0x41, 'b'); // b7-b4 FSDI = 4 (48 bytes), b3-b0 CID = 0
+        directCommand(0xC2);    // Clear FIFO
+        regWrite(0x1D, FIFOBlob.len() >> 8);    // Write # of Transmitted Bytes (MSB)
+        regWrite(0x1E, FIFOBlob.len() << 3);    // Write # of Transmitted Bytes (LSB)
+        FIFOWrite(FIFOBlob);    //write to the FIFO
+    	directCommand(0xC4);    // Send with CRC
+	}
+  
+    // Send PPS
+    function sendPPS() {
+        server.log("Sending PPS");
+      	receiveType = RECEIVE_TYPE.PPSR;    // Expect ATQA in response
+        local FIFOBlob = blob();
+        FIFOBlob.writen(0xD1, 'b'); // Start Byte (1101)b, CID = 0
+        FIFOBlob.writen(0x11, 'b'); // PPS0 - nothing special, although bit is set to show that we send PPS1
+        FIFOBlob.writen(0x0F, 'b'); // PPS1 - we send the DRI and DSI to be 8 (max bitrate)
+        directCommand(0xC2);    // Clear FIFO
+        regWrite(0x1D, FIFOBlob.len() >> 8);    // Write # of Transmitted Bytes (MSB)
+      	regWrite(0x1E, FIFOBlob.len() << 3);    // Write # of Transmitted Bytes (LSB)
+        FIFOWrite(FIFOBlob);    //write to the FIFO
+		directCommand(0xC4);    // Send with CRC
+    }
+  
 	// Receive Handler
 	function receiveHandler() {
 		local FIFO = FIFORead();
-//	    foreach (byte in FIFO) {
-//			server.log(format("Byte: 0x%02X", byte));
-//		}
-		if (receiveType == RECEIVE_TYPE_ATQA) {
+		if (receiveType == RECEIVE_TYPE.ATQA) {
 			if (!(atqa & 0xF020) && FIFO.len() == 2) {
-        server.log("SET CARDPRESENT = 1");
-        cardPresent = 1;
 				atqa = FIFO[1] << 8 | FIFO[0];
+                UIDsize = (FIFO[0] >> 6) + 1;   // 1 = single, 2 = double, 3 = triple
+                server.log(format("UIDsize: %01X", UIDsize));
 				server.log(format("Valid ATQA Received: %04X", atqa));
 				imp.sleep(0.005);   // Wait 5ms for card to be ready (maybe)
 				cascadeLevel = 1;
 				anticollision(0x20, false, false);
 			}
 			else {
-        server.log("SET CARDPRESENT = 0");
-        cardPresent = 0;
 				server.log("Invalid ATQA!");
 			}
 		}
-		else if (receiveType == RECEIVE_TYPE_ANTICOLLISION) {
+		else if (receiveType == RECEIVE_TYPE.ANTICOLLISION) {
 			server.log("Received anticollision frame.");
-      foreach (byte in FIFO) {
-  		  server.log(format("Byte: 0x%02X", byte));
-		  }
 			local final = false;
 			if (FIFO[0] != 0x88) {  // Check for cascade tag
 				UID.writen(FIFO[0], 'b');
@@ -230,27 +269,62 @@ class AS3911
 				return;
 			}
 		}
-		else if (receiveType == RECEIVE_TYPE_SAK) {
+		else if (receiveType == RECEIVE_TYPE.SAK) {
 			server.log("Received SAK");
 			if (FIFO[0] & 0x04) {
-				server.log("INCOMPLETE UID");
+				server.log("Incomplete UID");
 				cascadeLevel++;
 				anticollision(0x20, false, false);
 			}
 			else if (FIFO[0] & 0x20) {
-				server.log("COMPLETED UID!");
-        hardware.pin9.write(0);
+				server.log("Completed UID");
+                local UIDstring = "UID: ";
 				foreach (i, byte in UID) {
-					server.log(format("UID Byte %i: 0x%02X", i, byte));
+					UIDstring += format("%i 0x%02X, ", i, byte);
 				}
-        UID.flush();
-        UID.seek(0);
-        // receiveType = 0;
-        directCommand(0xC2);    // Clear FIFO / status registers
-        // cardPresent = 0;
-        // enterWakeup();
+                server.log(UIDstring);
+                sendRATS();
+                UID = blob();
 			}
 		}
+        else if (receiveType == RECEIVE_TYPE.ATS) {
+            server.log("RECEIVED ATS");
+            local ATSlen = FIFO[0];
+            local interfaceLen = 0;
+            if (~(FIFO[1] & 0x80)){
+                server.log("VALID ATS");
+                if(FIFO[1] & 0x10){ // Received TA
+                  interfaceLen++;
+                }
+                if(FIFO[1] & 0x20){ // Received TB
+                  interfaceLen++;
+                }
+                if(FIFO[1] & 0x40){ // Received TC
+                  interfaceLen++;
+                }
+                for(local i = 2; i<2+interfaceLen; i++){  // Load interface bytes
+                  interfaceBytes.writen(FIFO[i], 'b');
+                } 
+                for(local i = 2+interfaceLen; i<ATSlen; i++){ // Load historical bytes
+                  historicalBytes.writen(FIFO[i], 'b');
+                }
+                imp.sleep(0.005); // Can use SFGT defined in interface byte TB (Guard time needed for card to be ready)
+                sendPPS();
+            }else{
+                server.log("INVALID ATS");
+            }
+        }
+        else if (receiveType == RECEIVE_TYPE.PPSR) {
+            hardware.pinC.write(1);
+    		imp.wakeup(0.3, function(){hardware.pinC.write(0)});
+            server.log("RECEIVED PPSR")
+            local PPSRstring = "PPSR: "
+            foreach (byte in FIFO) {
+                PPSRstring += format("0x%02X, ", byte);
+        	}
+            stopCapInterrupt == false;
+            server.log(PPSRstring);
+        }
 		else {
 			server.log("Receive type [" + receiveType + "] unknown!");
 		}
@@ -259,12 +333,8 @@ class AS3911
 	// Interrupt Handler
 	function interruptHandler() {
 		if (irq.read()) {
-			// Clear previous interrupt flags
-			collision = 0;
-			server.log("***BEGIN INTERRUPT LIST***");
 			// Read main interrupt register first
 			local mainInterruptReg = regRead(0x17);
-			// Is there a smarter way to do this?
 			if (mainInterruptReg & 0x80) {
 				// Oscillator frequency has stabilized
 				server.log("Oscillator frequency stable.");
@@ -276,22 +346,23 @@ class AS3911
 			}
 			if (mainInterruptReg & 0x20) {
 				// Start of receive
-				server.log("Receive start.")
+				// server.log("Receive start.")
 			}
 			if (mainInterruptReg & 0x10) {
 				// End of receive
-				server.log("Receive end.")
+				// server.log("Receive end.")
 				imp.wakeup(0.01, receiveHandler.bindenv(this));
 			}
 			if (mainInterruptReg & 0x08) {
 				// End of transmit
-				server.log("Transmit end.");
+				// server.log("Transmit end.");
 			}
 			if (mainInterruptReg & 0x04) {
 				// Bit collision
 				server.error("Bit collision!");
+                hardware.pin9.write(1);
+        	    imp.wakeup(0.3, function(){hardware.pin9.write(0)});
 				regPrint(0x1C); // Print Collision Display Register
-				collision = 1;
 			}
 			if (mainInterruptReg & 0x02) {
 				// Timer or NFC interrupt
@@ -302,8 +373,7 @@ class AS3911
 				}
 				if (timerInterruptReg & 0x40) {
 					// No-response timer expire
-					server.log("No-reponse timer expired");
-          // enterWakeup();
+				// 	server.log("No-reponse timer expired");
 				}
 				if (timerInterruptReg & 0x20) {
 					// General purpose timer expire
@@ -336,18 +406,26 @@ class AS3911
 				if (wakeInterruptReg & 0x80) {
 					// CRC error
 					server.error("CRC error!");
+                    hardware.pin9.write(1);
+                    imp.wakeup(0.3, function(){hardware.pin9.write(0)});
 				}
 				if (wakeInterruptReg & 0x40) {
 					// Parity error
 					server.error("Parity error!");
+                    hardware.pin9.write(1);
+                    imp.wakeup(0.3, function(){hardware.pin9.write(0)});
 				}
 				if (wakeInterruptReg & 0x20) {
 					// Soft framing error
 					server.error("Soft framing error!");
+                    hardware.pin9.write(1);
+                    imp.wakeup(0.3, function(){hardware.pin9.write(0)});
 				}
 				if (wakeInterruptReg & 0x10) {
 					// Hard framing error
 					server.error("Hard framing error!");
+                    hardware.pin9.write(1);
+                    imp.wakeup(0.3, function(){hardware.pin9.write(0)});
 				}
 				if (wakeInterruptReg & 0x08) {
 					// Wake-up interrupt
@@ -361,114 +439,100 @@ class AS3911
 					// Wake-up interrupt due to Phase Measurement
 					server.log("Wake-up interrupt due to Phase Measurement");
 				}
-				if (wakeInterruptReg & 0x01) {
+				if (wakeInterruptReg & 0x01 && stopCapInterrupt == false) {
 					// Wake-up interrupt due to Capacitance Measurement
 					server.log("Wake-up interrupt due to Capacitance Measurement");
-					server.log(format("ADC value: 0x%02X", regRead(0x20)));
-          server.log("cardPresent: " + cardPresent);
-					
-					hardware.pin9.write(0);
-					imp.wakeup(0.1, function(){hardware.pin9.write(1)});
-					if(cardPresent==0){
-            server.log("TURNED CAPSENSE CARPRESENT = 1");
-            cardPresent=1;
-            enterReady();
-          }
+					if(cardPresent==0) {
+                        server.log("NEW CARD!");
+                        cardPresent=1;
+                        enterReady();
+                        resetTime = time() + CARD_RESET_TIME;
+                    }  
 				}            
 			}
 		}
 		else {
-			server.log("****END INTERRUPT LIST****");
 		}
 	}
 
 	// Calibrate capacitive sensor
 	function calibrateCapSense() {
 		server.log("Calibrating cap sensor...");
-		regWrite(0x2E, 0x01);   // Enable automatic calibration, gain 6.5V/pF
-		directCommand(0xDD);    // Calibrate
-		regWrite(0x3A, 0xA9);   //Set delta and auto-avg settings
+		regWrite(0x2E, 0x0);    // Enable automatic calibration, gain 6.5V/pF
+		regWrite(0x3A, 0x79);   //Set delta and auto-avg settings
+    	directCommand(0xDD);    // Calibrate to parasitic capacitance
 		local capSenseDisplayReg = regRead(0x2F);
 		if (capSenseDisplayReg & 0x04) {
-			local cal = capSenseDisplayReg >> 3 & 0x1F;
-			server.log("Capacitive sensor calibrated. Value: " + cal);
+			server.log("Capacitive sensor calibrated. Value: ");
+            measureCapSense();
 		}
 		else if (capSenseDisplayReg & 0x02) {
 			server.log("Calibration error!");
 		}
 	}
 
-	// Measure the capacitive sensor once
+	// Measure the capacitive sensor once - this happens automatically in wakeup mode. Mostly for debug
 	function measureCapSense() {
 		directCommand(0xDE);
 		local capResult = regRead(0x20);
-		server.log(capResult);
-		//imp.wakeup(0.5, measureCapSense);
-	}
-
-	// Send REQA
-	function sendREQA() {
-		server.log("Sending REQA");
-		receiveType = RECEIVE_TYPE_ATQA;    // Expect ATQA in response
-		directCommand(0xC2);    // Clear (not necessary, but what the hell)
-		directCommand(0xC6);    // Send REQA
-//		if (cardPresent) imp.wakeup(1, sendREQA.bindenv(this));
+		server.log("ADC: " + capResult + ", Cap Display Reg: " + regRead(0x3D) + ", Auto-Avg Reg: " + regRead(0x3C) + ", Reference Reg: " + regRead(0x3B));
 	}
   
-  // Turn Radios off (RX and TX)
-  function radioOFF(){
-    clearBit(0x02, 6); 
-    clearBit(0x02, 3);
-    server.log("Radios off."); 
-  }
+    // Turn Radios off (RX and TX)
+    function radioOFF(){
+        clearBit(0x02, 6);
+        clearBit(0x02, 3);
+        server.log("Radios off.");
+    }
 
 	function enterReady() {
-		// cardPresent = 1;
-		regWrite(0x02, 0x80);   // Operation Control - Enable ready mode (en -> 1)
 		regWrite(0x05, 0x01);   // Anticollision bit set (antcl)
+    	regWrite(0x02, 0x80);   // Operation Control - Enable ready mode (en -> 1)
 		server.log("Ready mode enabled.");
-		// Should technically wait for oscillator to stabilize here - but how?
+		// Should technically wait for oscillator to stabilize here - hasn't caused any trouble though
 		
 		directCommand(0xD6);    // Adjust Regulators
 		directCommand(0xD8);    // Calibrate Antenna
 		regWrite(0x02, 0xC8);   // Tx/Rx Enable
 		imp.sleep(0.005);       // Wait 5ms for reader field to stabilize
-		server.error("INSERT CARD NOW!");
-		hardware.pin9.write(0);
-		imp.sleep(1);
-		hardware.pin9.write(1);
 		
 		sendREQA();             // Send REQA
-		
-		// imp.wakeup(10, function(){ this.cardPresent <- 0; enterWakeup(); });
 	}
 
 	function enterWakeup(){
-    server.log("Entering Wakeup");
-		regWrite(0x31, 0x01); //Wake-up timer Control - CapSense at every timeo0ut (wcap -> 1)
-		regWrite(0x02, 0x04); //Operation Control - Enable wakeup mode (wu -> 1)
+        server.log("Wakeup mode enabled");
+		regWrite(0x31, 0x01); //Wake-up timer Control - CapSense at every 100ms (wcap -> 1)
+        regWrite(0x2E, 0x0);   // Enable automatic calibration, gain 6.5V/pF
+    	regWrite(0x3A, 0x79);   //Set delta and auto-avg settings
+		regWrite(0x02, 0x04); //Operation Control - Enable wakeup mode (wu -> 1) 
+        //NOTE: this command to enter wakeup mode must be made AFTER setting all registers with capacitance settings / calibration values
 	}
+    
+    
   
-  // Check to make sure the IRQ pin isn't stuck high
-	function pollIRQ() {
-		if (irq.read()) {
-      interruptHandler();
-		}else{ 
-      // server.log("hi");
-      // server.log("cardPresent: " + cardPresent);
-      if(sleepTime < time() && cardPresent==1){
-        server.log("TURNED RESET CARDPRESENT=0")
-        cardPresent = 0;
-        enterWakeup();
-        server.log("cardPresent: " + cardPresent);
-		  }
-		}
-	}
+    // Check to make sure the IRQ pin isn't stuck high
+    function pollIRQ() {
+        if (irq.read()) {
+            interruptHandler();
+        }else{
+            if(resetTime < time() && cardPresent==1){
+                server.log("TURNED RESET CARDPRESENT=0")
+                stopCapInterrupt = false;
+                cardPresent = 0;
+                enterWakeup();
+            }else if(resetTime + SLEEP_TIME < time()){
+                radioOFF();
+                imp.onidle(function() { server.sleepfor(24*60*60-60); });
+            }
+        }
+    }
 }
 
-//irq <- hardware.pin1;
-//spi <- hardware.spi257;
-//cs_l <- hardware.pin8;
+
+imp.configure("RFID AS3911", [], []);
+imp.setpowersave(true);
+imp.enableblinkup(true);
+
 RFID <- AS3911(hardware.pin1, hardware.spi257, hardware.pin8);
 
 // Configure I/O
@@ -478,17 +542,18 @@ RFID.cs_l.write(1);
 // SPI Mode 1: CPOL = 0, CPHA = 1
 RFID.spi.configure(CLOCK_IDLE_LOW | CLOCK_2ND_EDGE, FREQ);
 
-imp.configure("RFID AS3911", [], []);
 
 //LED
-hardware.pin9.configure(DIGITAL_OUT_OD);
-hardware.pin9.write(1);
+hardware.pin9.configure(DIGITAL_OUT);
+hardware.pin9.write(0);
+hardware.pinC.configure(DIGITAL_OUT);
+hardware.pinC.write(0);
 
 // Initialization
 RFID.directCommand(0xC1);    // (C1) Set Default
 RFID.directCommand(0xC2);    // (C2) Clear
 RFID.regWrite(0x00, 0x0F);   // IO Config 1 - Disable MCU_CLK output
-RFID.regWrite(0x01, 0x00);   // IO Config 2 - Defaults
+RFID.regWrite(0x01, 0x80);   // IO Config 2 - Defaults
 RFID.regWrite(0x02, 0x00);   // Operation Control - Defaults, power-down mode
 RFID.regWrite(0x03, 0x08);   // Mode Definition - ISO14443a (no auto rf collision)
 RFID.regWrite(0x04, 0x00);   // Bit Rate Definition - fc/128 (~106kbit/s) lowest
@@ -498,19 +563,15 @@ RFID.regWrite(0x10, 0x15);   // No-response Timer - 21 steps, ~100us (LSB)
 
 RFID.directCommand(0xCC);    // Analog Preset
 RFID.calibrateCapSense();    // Calibrate Capacitive Sensor
-RFID.regWrite(0x2A, 0x00);   // Regulator Voltage Control - Automatic, Defaults
-
 
 function poll(){
-  RFID.pollIRQ();
-  imp.wakeup(1, poll);
+    RFID.pollIRQ();
+    imp.wakeup(1 , poll);
 }
 
-RFID.enterWakeup();
-// RFID.enterReady();
+RFID.stopCapInterrupt = false;
+RFID.cardPresent = 1;   // To handle the case where we are sleeping and a card is held over the device, we assume we are in this case on wakeup
+RFID.enterReady();      // Send out a pulse immediately to see if there has been a card waiting for us.
 poll();
-// imp.wakeup(6, function(){ RFID.radioOFF(); RFID.cardPresent=0; hardware.pin9.write(1);});
-
 
 server.log("End of code.");
-
